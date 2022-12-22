@@ -2,13 +2,77 @@ AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
 Description: Serverless patterns - Amazon API Gateway REST API with S3 integration
 Resources:
+  WAFforcloudfront:
+    Type: 'AWS::WAFv2::WebACL'
+    Properties:
+      Name: ExampleWebACL1
+      Scope: REGIONAL
+      Description: This is an example WebACL
+      DefaultAction:
+        Allow:
+          CustomRequestHandling:
+            InsertHeaders:
+              - Name: AllowActionHeader1Name
+                Value: AllowActionHeader1Value
+              - Name: AllowActionHeader2Name
+                Value: AllowActionHeader2Value
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: ExampleWebACLMetric
+      CustomResponseBodies:
+        CustomResponseBodyKey1:
+          ContentType: TEXT_PLAIN
+          Content: this is a plain text
+        CustomResponseBodyKey2:
+          ContentType: APPLICATION_JSON
+          Content: '{"jsonfieldname": "jsonfieldvalue"}'
+        CustomResponseBodyKey3:
+          ContentType: TEXT_HTML
+          Content: <html>HTML text content</html>
+      Rules:
+        - Name: RuleWithAWSManagedRules
+          Priority: 0
+          OverrideAction:
+            Count: {}
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: RuleWithAWSManagedRulesMetric
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+              ExcludedRules: []
+        - Name: BlockXssAttack
+          Priority: 1
+          Action:
+            Block:
+              CustomResponse:
+                ResponseCode: 503
+                CustomResponseBodyKey: CustomResponseBodyKey1
+                ResponseHeaders:
+                  - Name: BlockActionHeader1Name
+                    Value: BlockActionHeader1Value
+                  - Name: BlockActionHeader2Name
+                    Value: BlockActionHeader2Value
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: BlockXssAttackMetric
+          Statement:
+            XssMatchStatement:
+              FieldToMatch:
+                AllQueryArguments: {}
+              TextTransformations:
+                - Priority: 1
+                  Type: NONE
   CloudFrontOriginAccessIdentity:
     Type: 'AWS::CloudFront::CloudFrontOriginAccessIdentity'
     Properties:
       CloudFrontOriginAccessIdentityConfig:
         Comment: 'Serverless website OA'
-  
-
+  #cloudfront distribution
   CloudfrontDistribution:
     Type: "AWS::CloudFront::Distribution"
     Properties:
@@ -37,36 +101,16 @@ Resources:
             QueryString: false
           TargetOriginId: s3-website
           ViewerProtocolPolicy : redirect-to-https
-  MyWafRuleGroup:
-    Type: AWS::WAFv2::RuleGroup
-    Properties:
-      Capacity: 1000
-      Description: My WAF Rule Group
-      Rules:
-        - Name: MyWafRule
-          Priority: 1
-          Action:
-            Block
-          VisibilityConfig:
-            Sampled: false
-            CloudWatchMetricsEnabled: true
-  MyCloudFrontDistributionWafAssociation:
-    Type: AWS::CloudFront::DistributionWebACLAssociation
-    Properties:
-      DistributionId: !Ref CloudfrontDistribution
-      WebACLId: !Ref MyWafRuleGroup
-
   S3Bucket:
     Type: AWS::S3::Bucket
     Properties:
       # Change bucket name to reflect your website
-      BucketName: proarchsubodhminfy.com
-  S3Bucket2:
+      BucketName: proarchpocsubodhminfy.com
+  AuthCodeBucket:
     Type: AWS::S3::Bucket
     Properties:
       # Change bucket name to reflect your website
       BucketName: codeforauthrozier
-
   S3BucketPolicy:
     Type: AWS::S3::BucketPolicy
     Properties:
@@ -84,7 +128,7 @@ Resources:
   BasicAuthorizerFunction:    #lambda authorizer for apigateway root url of Cloud Front Distribution
     Type: AWS::Serverless::Function
     Properties:
-      CodeUri: s3://proarchphani/index.zip
+      CodeUri: s3://codeforauthrozier/index.zip
       Handler: index.handler
       Runtime: nodejs18.x
    # REST API
@@ -137,7 +181,7 @@ Resources:
       Integration:
         Type: HTTP
         IntegrationHttpMethod: GET
-        Uri:  !Sub "https://${CloudfrontDistribution}.cloudfront.net/{uri}"  #specify the endpoint of cloudfront configured
+        Uri: !Sub "https://${CloudfrontDistribution}.cloudfront.net/"  #specify the endpoint of cloudfront configured
         IntegrationResponses:
           - StatusCode: 200
             ResponseParameters:
@@ -212,13 +256,59 @@ Resources:
           Action:
           - sts:AssumeRole
       Path: "/"
-Outputs:
-  # API Gateway endpoint to be used during tests
-  AppApiEndpoint:
-    Description: API Endpoint
-    Value: !Sub "https://${AppApi}.execute-api.${AWS::Region}.amazonaws.com/Prod"
-  BasicAuthorizerFunction:
-    Description: Basic authorizer Lambda Function ARN
-    Value: !GetAtt BasicAuthorizerFunction.Arn
-    Export:
-      Name: BasicAuthorizerFunction-Arn
+  ETLJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Command:
+        Name: glueetl
+        ScriptLocation: s3://proarchsource-bucket/data.json
+      DefaultArguments:
+        --TempDir: s3://my-temp-dir
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      MaxRetries: 3
+      Name: my-etl-job
+      Role: arn:aws:iam::058547972331:role/GlueServiceRole
+      Timeout: 2880
+      GlueVersion: '2.0'
+
+  ETLTrigger:
+    Type: AWS::Glue::Trigger
+    Properties:
+      Type: SCHEDULED
+      Schedule: rate(5 minutes)
+      Actions:
+        - JobName: !Ref ETLJob
+
+  ETLS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: etl-outputbucket
+
+  ETLLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: s3://proarchsource-bucket/my_lambda.zip
+      Handler: index.handler
+      Runtime: python3.8
+      Timeout: 30
+      Events:
+        S3Trigger:
+          Type: S3
+          Properties:
+            Bucket: !Ref ETLS3Bucket
+            Events: s3:ObjectCreated:*
+
+  ETLDynamoDBTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      ProvisionedThroughput:
+        ReadCapacityUnits: 1
+        WriteCapacityUnits: 1
+      TableName: my-dynamodb-table
